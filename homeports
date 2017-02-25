@@ -1,0 +1,264 @@
+#!/bin/bash
+set -eu
+VERSION=0.0.1
+
+# where should we cache things like the cloned git
+# working copies of recipes?
+HOMEPORT_CACHE=${HOMEPORT_CACHE:-$HOME/.homeports}
+
+# set so that sourced scripts can determine if they
+# are executing correctly, or were run directly.
+HOMEPORT_IS_RUNNING_THE_SHOW=yup
+
+# where should the data live?
+HOMEPORT_DATA=/srv/homeports
+
+# the name of the running command / sub-command,
+# for better error messaging.
+HOMEPORT_INTERNAL_COMMAND=$0
+
+# will contain the name of the port to use
+# (interpretation depends on the command being run)
+HOMEPORT_INTERNAL_NAME=
+
+# will contain the name of the homeport Github
+# repository, complete with the organization name
+HOMEPORT_INTERNAL_REPO=
+
+# will contain the name of the branch / tag to pull
+# from Github, i.e. 'master' for version 'latest'
+HOMEPORT_INTERNAL_BRANCH=
+
+# will contain the full path to the deployment recipe
+# that docker-compose will use
+HOMEPORT_INTERNAL_COMPOSE_FILE=
+
+# will be set by the ask_* functions, based on how
+# the user responds to our probing questions.
+HOMEPORT_INTERNAL_LAST_VALUE=
+
+main() {
+	if [[ -z "${1:-}" ]]; then
+		set "help"
+	fi
+	case "$1" in
+	(-h|--help|help)
+		shift ; help "$@" >&2
+		exit 0
+		;;
+	(-v|--version|version)
+		echo "homeports v${VERSION}"
+		exit 0
+		;;
+	(list)    shift ; do_list    "$@" ;;
+	(fetch)   shift ; do_fetch   "$@" ;;
+	(build)   shift ; do_build   "$@" ;;
+	(run)     shift ; do_run     "$@" ;;
+	(stop)    shift ; do_stop    "$@" ;;
+	(*)
+		echo >&2 "unrecognized command '$1'"
+		shift ; help commands >&2
+		exit 2
+		;;
+	esac
+}
+
+help() {
+	local topic="${1:-commands}"
+	case "$topic" in
+	(commands)
+		echo "$0 command [options]"
+		echo
+		echo "Commands:"
+		printf "  %-10s  %s\n" help "Show the help."
+		printf "  %-10s  %s\n" list "List the running ports."
+		printf "  %-10s  %s\n" run  "Run a new port."
+		printf "  %-10s  %s\n" stop "Stop a running port."
+		echo
+		printf "  %-10s  %s\n" fetch "Fetch a port definition, but do not run it."
+		printf "  %-10s  %s\n" build "Build a port configuration, but do not run it."
+		echo
+		;;
+	(help)
+		echo "so meta"
+		;;
+	(list)
+		echo "$0 list"
+		echo
+		echo "Lists all the ports running on the local host."
+		;;
+	(run)
+		echo "$0 run PORT-NAME[/VERSION]"
+		echo
+		echo "Fetches the given port from Github, and then runs"
+		echo "it on the local host."
+		;;
+	(*)
+		echo "Unrecognized help topic '$topic'"
+		echo
+		echo "Try one of these:"
+		echo "  $0 help"
+		echo "  $0 help run"
+		echo "  $0 help list"
+		;;
+	esac
+}
+
+do_list() {
+	exec docker ps
+}
+
+# homeports fetch NAME[/VERSION]
+do_fetch() {
+	HOMEPORT_INTERNAL_COMMAND=fetch
+	if ! get_port_name_and_version "${1:-}"; then
+		help >&2
+		exit 1
+	fi
+
+	should_have_the_repo
+}
+
+# homeports build NAME/[VERSION]
+do_build() {
+	HOMEPORT_INTERNAL_COMMAND=run
+	if ! get_port_name_and_version "${1:-}"; then
+		help >&2
+		exit 1
+	fi
+
+	should_have_the_repo
+
+	(cd ${HOMEPORT_INTERNAL_CACHED_REPO} ; source ./pack) 1>&2 3> "${HOMEPORT_INTERNAL_COMPOSE_FILE}"
+	cat ${HOMEPORT_INTERNAL_COMPOSE_FILE}
+}
+
+# homeports run NAME[/VERSION]
+do_run() {
+	HOMEPORT_INTERNAL_COMMAND=run
+	if ! get_port_name_and_version "${1:-}"; then
+		help >&2
+		exit 1
+	fi
+
+	should_have_the_repo
+
+	if [[ ! -s "${HOMEPORT_INTERNAL_COMPOSE_FILE}" ]]; then
+		(cd ${HOMEPORT_INTERNAL_CACHED_REPO} ; source ./pack) 1>&2 3> "${HOMEPORT_INTERNAL_COMPOSE_FILE}"
+	fi
+	exec docker-compose -f "${HOMEPORT_INTERNAL_COMPOSE_FILE}" up -d
+}
+
+# homeports stop NAME
+do_stop() {
+	HOMEPORT_INTERNAL_COMMAND=stop
+	if ! get_port_name_and_version "${1:-}" >/dev/null; then
+		help >&2
+		exit 1
+	fi
+
+	if [[ -s "${HOMEPORT_INTERNAL_COMPOSE_FILE}" ]]; then
+		echo "stopping composition from ${HOMEPORT_INTERNAL_COMPOSE_FILE}"
+		docker-compose -f "${HOMEPORT_INTERNAL_COMPOSE_FILE}" down
+	fi
+}
+
+# need_data rel/ative/path
+need_data() {
+	local relpath=${1:-""}
+	mkdir -p "${HOMEPORT_DATA}/${HOMEPORT_INTERNAL_NAME}/${relpath}" || return 1
+	echo "${HOMEPORT_DATA}/${HOMEPORT_INTERNAL_NAME}/${relpath}"
+}
+
+# need_a_cache rel/ative/path
+need_a_cache() {
+	local relpath=${1:-""}
+	mkdir -p "${HOMEPORT_CACHE}/${relpath}" || return 1
+	echo "${HOMEPORT_CACHE}/${relpath}"
+}
+
+# Try to clone the desired Github repo.
+should_have_the_repo() {
+	HOMEPORT_INTERNAL_CACHED_REPO="$(need_a_cache "${HOMEPORT_INTERNAL_REPO}")"
+	pushd "${HOMEPORT_INTERNAL_CACHED_REPO}" &>/dev/null
+	if [[ -d work ]]; then
+	  cd work
+	  git reset --hard HEAD                           &>/dev/null
+	  git fetch origin ${HOMEPORT_INTERNAL_BRANCH}    &>/dev/null
+	  git checkout origin/${HOMEPORT_INTERNAL_BRANCH} &>/dev/null
+	else
+	  git clone https://github.com/${HOMEPORT_INTERNAL_REPO} \
+	            -b ${HOMEPORT_INTERNAL_BRANCH} \
+	            work >/dev/null
+	  cd work
+	fi
+	HOMEPORT_INTERNAL_CACHED_REPO="${HOMEPORT_INTERNAL_CACHED_REPO}/work"
+	echo "github repo ${HOMEPORT_INTERNAL_REPO} @${HOMEPORT_INTERNAL_BRANCH} [$(git_commit_id)] retrieved ok."
+	popd &>/dev/null
+}
+
+# get_port_name_and_version "NAME[/VERSION]"
+#
+# retreives the the name and version of the desired homeport,
+# according to the string representation passed as the first
+# agument.  Values must take the form of NAME[/VERSION].
+# If no VERSION is specified, assume latest (dockerhub), which
+# is the master branch on Github.  Otherwise, take the version
+# to be a tag (without the leading 'v').
+#
+# Sets the following environment variables:
+#   - HOMEPORT_INTERNAL_NAME
+#   - HOMEPORT_INTERNAL_REPO
+#   - HOMEPORT_INTERNAL_BRANCH
+#
+# Returns failure (non-zero) if the string is empty.  No guarantee
+# about the validity (i.e. existence) of the given port/version is
+# made - callers have to check that in their own code, their own way.
+#
+get_port_name_and_version() {
+	local name_and_version="${1:-}"
+	if [[ -z "$name_and_version" ]]; then
+		echo >&2 "${HOMEPORT_INTERNAL_COMMAND}: missing required port-name[/version]"
+		return 1
+	fi
+
+	local name_only="${name_and_version%/*}"
+	if [[ "$name_only" = "$name_and_version" ]]; then
+		HOMEPORT_INTERNAL_NAME=$name_and_version
+		echo "${HOMEPORT_INTERNAL_COMMAND}: using the latest available version port ${HOMEPORT_INTERNAL_NAME}."
+		HOMEPORT_INTERNAL_BRANCH="master"
+	else
+		version_only="${name_and_version#*/}"
+		HOMEPORT_INTERNAL_NAME=$name_only
+		echo "${HOMEPORT_INTERNAL_COMMAND}: using v${version_only} of ${HOMEPORT_INTERNAL_NAME}."
+		HOMEPORT_INTERNAL_BRANCH="v${version_only}"
+	fi
+
+	HOMEPORT_INTERNAL_REPO="homeports/${HOMEPORT_INTERNAL_NAME}-port"
+	HOMEPORT_INTERNAL_COMPOSE_FILE=$(need_a_cache "${HOMEPORT_INTERNAL_REPO}")/compose.yml
+	return 0
+}
+
+# print current working directory HEAD commit id
+git_commit_id() {
+	git rev-list --abbrev-commit --max-count=1 HEAD
+}
+
+# ask the user for a string
+ask_for() {
+	local prompt="${1:-}"
+	local default="${2:-}"
+	local value=
+
+	while [[ -z "${value}" ]]; do
+		echo -ne "${prompt}  "
+		read value
+		if [[ -n "${default}" && -z "${value}" ]]; then
+			value="${default}"
+		fi
+	done
+
+	HOMEPORT_INTERNAL_LAST_VALUE="${value}"
+}
+
+main "$@"
