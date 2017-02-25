@@ -183,7 +183,7 @@ need_a_cache() {
 
 # Try to clone the desired Github repo.
 should_have_the_repo() {
-	if [[ -n "${REPO:-}" ]]; thenRT_DEV_
+	if [[ -n "${REPO:-}" ]]; then
 		echo "using ${REPO} as source of truth..."
 		HOMEPORT_INTERNAL_CACHED_REPO="${REPO}"
 		return 0
